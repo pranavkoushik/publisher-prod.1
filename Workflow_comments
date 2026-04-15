@@ -1,0 +1,313 @@
+# Joveo Publisher Intelligence Project Workflow
+#
+# 1. Purpose
+# This project runs an automated weekday intelligence workflow for Joveo.
+# Its job is to research recent publisher-related updates, summarize the most
+# relevant developments, post a digest to Slack, and record which URLs have
+# already been sent so they are not posted again in future runs.
+#
+# 2. Main Runtime Entry Points
+# There are two supported ways to run the workflow:
+#
+# - Local CLI run:
+#   `python brief.py`
+#
+# - Vercel scheduled run:
+#   Vercel cron triggers the HTTP route `/api/cron`
+#
+# The local file `brief.py` is only a lightweight wrapper.
+# The actual workflow logic lives in `publisher_intel.py`.
+# The Vercel HTTP entrypoint lives in `api/cron.py`.
+#
+# 3. Scheduling
+# The project is configured for Vercel cron in `vercel.json`.
+# The current schedule is:
+#
+# - `30 4 * * 1-5`
+#
+# This means:
+#
+# - 04:30 UTC
+# - Monday through Friday
+# - which corresponds to 10:00 AM IST on weekdays
+#
+# 4. Request Flow on Vercel
+# When Vercel cron triggers the project:
+#
+# - Vercel calls `/api/cron`
+# - `api/cron.py` checks whether the request is authorized
+# - If `CRON_SECRET` is configured, the request must include the correct
+#   `Authorization: Bearer <CRON_SECRET>` header
+# - If authorization succeeds, the handler calls `run_publisher_intel()`
+# - The handler returns a JSON response showing whether the job posted,
+#   skipped, or failed
+#
+# 5. Environment Variables Used by the Project
+# The workflow depends on the following environment variables:
+#
+# - `SLACK_WEBHOOK_URL`
+#   Used to post the final digest into Slack
+#
+# - `GEMINI_API_KEY`
+#   Used by the Google GenAI SDK to generate the final text summary
+#
+# - `TAVILY_API_KEY`
+#   Used for real-time web/news search
+#
+# - `GEMINI_MODEL`
+#   Controls which Gemini model is used
+#   Default is `gemini-2.5-flash-lite`
+#
+# - `GOOGLE_SERVICE_ACCOUNT_JSON`
+#   Contains the Google service-account credentials used to access the
+#   Google Sheet that stores previously-sent URLs
+#
+# - `GOOGLE_SHEET_NAME`
+#   Name of the spreadsheet used for sent URL tracking
+#
+# - `GOOGLE_WORKSHEET_NAME`
+#   Name of the worksheet/tab inside that spreadsheet
+#
+# - `CRON_SECRET`
+#   Protects the Vercel cron endpoint from unauthorized requests
+#
+# 6. High-Level Workflow in `run_publisher_intel()`
+# The complete workflow in `publisher_intel.py` follows these steps:
+#
+# - Load runtime configuration from environment variables
+# - Create a Tavily client
+# - Determine which publisher group should be covered today
+# - Fetch recent news for that group
+# - Apply preliminary filtering to remove obviously stale URLs
+# - Rank and limit the result set
+# - Filter the results by recency and reject aggregator-style pages
+# - Deduplicate articles by URL
+# - Load previously-sent URLs from Google Sheets
+# - Remove items that were already sent in earlier runs
+# - If no valid items remain, send a fallback "no impactful updates" message
+# - If valid items remain, send them to Gemini for summary generation
+# - Post the generated brief to Slack
+# - Only after a successful Slack post, save the URLs to Google Sheets
+#
+# 7. Day-Based Publisher Coverage Logic
+# Publisher coverage changes based on the weekday.
+# The workflow does not research the full master list every day.
+# Instead, it splits the publishers into scheduled groups.
+#
+# Coverage pattern:
+#
+# - Monday:
+#   P0 publishers
+#
+# - Tuesday:
+#   P1/P2 Batch 1
+#
+# - Wednesday:
+#   P1/P2 Batch 2
+#
+# - Thursday:
+#   P0 publishers
+#
+# - Friday:
+#   P1/P2 Batch 3
+#
+# - Saturday and Sunday:
+#   skipped
+#
+# For the P1/P2 list:
+#
+# - the full list is sorted alphabetically
+# - the sorted list is split into 3 batches
+# - the code rotates which exact alphabetical slice is used each week
+#   using the ISO week number
+#
+# This allows the project to cover the larger P1/P2 universe across time
+# without researching the entire long list every single day.
+#
+# 8. News Collection Logic
+# News collection is handled by `fetch_news()`.
+# For each publisher in today’s selected batch:
+#
+# - the code builds a Tavily search query
+# - the query looks for signals like:
+#   funding, acquisitions, hiring, layoffs, product launches,
+#   partnerships, integrations, growth, strategy, AI, updates
+# - Tavily returns up to 3 results per publisher
+# - all results are combined into one raw list
+#
+# This is intended to capture recent strategic updates relevant to Joveo.
+#
+# 9. Preliminary Filtering
+# After the raw results are collected, `quick_filter()` removes obviously
+# stale content before deeper processing.
+#
+# This filter looks for old year markers in URLs.
+# If a URL appears to point to content from older years, it is skipped.
+#
+# This step reduces noise and helps later ranking/filtering work on a
+# cleaner candidate set.
+#
+# 10. Ranking and Limiting
+# The function `soft_rank_and_limit()` scores items using broad keyword
+# signals such as:
+#
+# - launch
+# - feature
+# - product
+# - update
+# - AI
+# - partnership
+# - integration
+# - expansion
+# - growth
+# - hiring
+# - strategy
+#
+# It also gives a small preference to longer text content.
+# After scoring, the code keeps only the top-ranked items.
+#
+# This step narrows the candidate set before recency validation.
+#
+# 11. Recency Validation
+# The function `filter_recent_news()` keeps only items that appear to be
+# within the last 7 days.
+#
+# It determines publish dates using multiple fallbacks:
+#
+# - Tavily `published_date` metadata
+# - article HTML meta tags from the live page
+# - date extraction from article snippet text
+#
+# It also skips likely aggregator pages such as:
+#
+# - roundup pages
+# - trackers
+# - company lists
+# - market update pages
+#
+# This keeps the final digest focused on individual, timely updates rather
+# than broad index pages or stale articles.
+#
+# 12. Deduplication
+# The function `deduplicate_news()` removes duplicate entries by URL.
+# This is necessary because the same article may appear multiple times across
+# different search results or publisher queries.
+#
+# 13. Previously-Sent URL Filtering
+# The function `load_sent_urls()` reads column A from the configured Google
+# Sheet and turns it into a set of URLs.
+#
+# Once those URLs are loaded:
+#
+# - any newly fetched item whose URL is already in the sheet is removed
+#
+# This prevents the same article from being posted to Slack repeatedly
+# across multiple workflow runs.
+#
+# 14. Behavior When No New Valid Items Exist
+# If all items are filtered out because they are:
+#
+# - too old
+# - duplicates
+# - aggregator pages
+# - already sent
+#
+# then the project still posts a fallback message to Slack saying that no
+# impactful updates relevant to Joveo were found for that day’s coverage.
+#
+# This keeps the workflow predictable and still confirms that the run happened.
+#
+# 15. Brief Generation with Gemini
+# If valid items remain, `generate_brief()` sends the curated news context
+# to Gemini using the Google GenAI SDK.
+#
+# Gemini is instructed to:
+#
+# - select the top 5 most impactful updates
+# - focus only on the provided real-time news data
+# - keep the updates within the last 7 days
+# - format the response as a Slack-ready digest
+# - use impact emojis such as:
+#   `🔥`, `⚠️`, `📈`, `🧠`
+# - include a one-sentence insight and the source URL for each item
+#
+# The result is a human-readable Slack digest tailored to Joveo.
+#
+# 16. Slack Posting
+# The function `post_to_slack()` sends the generated digest to the configured
+# Slack incoming webhook.
+#
+# It also retries a few times if the request fails due to a transient issue.
+#
+# This improves reliability for network-related failures.
+#
+# 17. Sent URL Persistence
+# The function `save_sent_urls()` writes newly sent URLs into the Google Sheet.
+#
+# Important behavior:
+#
+# - URLs are now saved only after Slack confirms a successful post
+#
+# This is important because it prevents false positives where a failed Slack
+# post would otherwise mark items as already sent and block them from retrying
+# in the next run.
+#
+# 18. Google Sheets Role in the Workflow
+# Google Sheets acts as the project’s de-duplication ledger.
+# It stores the URLs that have already been posted to Slack.
+#
+# The sheet is not used as the main source of news data.
+# Instead, it is used only to remember what has already been sent.
+#
+# 19. Local Development Behavior
+# During local development:
+#
+# - `.env` can supply all required secrets
+# - `GOOGLE_SERVICE_ACCOUNT_JSON` can be used directly
+# - if `GOOGLE_SERVICE_ACCOUNT_JSON` is empty, the code can fall back to
+#   `credentials.json`
+#
+# This fallback is useful locally, but Vercel should rely on the env var.
+#
+# 20. Production Deployment Behavior
+# In production on Vercel:
+#
+# - the cron route should be protected with `CRON_SECRET`
+# - credentials should come from `GOOGLE_SERVICE_ACCOUNT_JSON`
+# - `credentials.json` should not be relied on
+# - Vercel cron should call the route on weekdays at 10:00 AM IST
+#
+# 21. Core Files and Their Roles
+# `brief.py`
+# Small local CLI wrapper that calls the main workflow
+#
+# `publisher_intel.py`
+# Main business logic and workflow orchestration
+#
+# `api/cron.py`
+# Vercel HTTP handler that triggers the workflow
+#
+# `vercel.json`
+# Vercel deployment config, function settings, and cron schedule
+#
+# `.env`
+# Local environment variables for development/testing
+#
+# `.env.example`
+# Template showing what env vars need to be configured
+#
+# `requirements.txt`
+# Python runtime dependencies
+#
+# 22. Intended Outcome of the Project
+# The intended outcome is a repeatable, weekday intelligence workflow that:
+#
+# - researches a scheduled publisher cohort
+# - surfaces relevant strategic updates
+# - converts them into a concise Slack digest
+# - avoids duplicate reporting
+# - maintains a reliable memory of already-posted articles
+#
+# In short:
+# the project automates publisher intelligence gathering and delivery for Joveo
+# while keeping the Slack feed focused, timely, and non-repetitive.
